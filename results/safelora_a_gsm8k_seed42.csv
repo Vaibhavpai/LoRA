@@ -1,0 +1,2 @@
+step,variant,refusal_rate,gsm8k_accuracy,mean_alignment
+2000,safelora_a,0.74,0.505,3.914340465728726e-07

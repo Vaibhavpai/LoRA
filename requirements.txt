@@ -1,0 +1,32 @@
+# LoRA-SafeLoop: Core Dependencies
+# -------------------------------------------------------
+# Install for LOCAL development (CPU only, Phases 1-3):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+#
+# On KAGGLE (Phases 4-6), PyTorch + CUDA is pre-installed.
+# Just run:
+#   pip install -r requirements.txt
+# -------------------------------------------------------
+
+# --- Model & Training ---
+transformers>=4.40.0      # HuggingFace model hub, tokenizers, Qwen2.5 support
+peft>=0.10.0              # LoRA adapter implementation (lora_A, lora_B, hooks)
+accelerate>=0.28.0        # Distributed training utilities, gradient accumulation
+datasets>=2.18.0          # GSM8K, Alpaca dataset loading from HuggingFace Hub
+sentencepiece>=0.1.99     # Required by some tokenizers (Qwen2.5 dependency)
+
+# --- Core Numerics ---
+torch>=2.1.0              # PyTorch — backward hooks, SVD, tensor ops
+numpy>=1.24.0             # Array operations, SVD wrappers
+
+# --- API Judge ---
+google-genai>=0.1.0       # Modern Gemini API client (Phase 1.3 refusal judge)
+
+# --- Logging & Plotting ---
+pandas>=2.0.0             # CSV logging for all experiment results
+matplotlib>=3.7.0         # Drift curve plots (Figure 1 of paper)
+tqdm>=4.66.0              # Progress bars for evaluation loops
+
+# --- Utilities ---
+protobuf>=3.20.0          # Dependency for tokenizer serialization
