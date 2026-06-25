@@ -1,12 +1,27 @@
 """
-agent.py — Phase 6, Steps 6.2–6.3
+agent.py — Phase 6, Steps 6.2-6.3
 ====================================
 LLM-based training controller for LoRA-SafeLoop.
 
+v4 update (continuous soft penalty mechanism):
+  Constraint is no longer a periodic SVD weight-projection. Instead, every
+  per-layer lambda controls the WEIGHT of an auxiliary loss term added every
+  single training step:
+      penalty = sum_l  lambda_l * || (B_l @ A_l) @ P_l ||_F^2
+      total_loss = task_loss + penalty_scale * penalty
+  Gradient descent then continuously steers ΔW away from the unsafe
+  subspace, instead of drifting freely for 99 steps and getting yanked back
+  by a hard projection every 100th step. Lambda still only changes at eval
+  checkpoints (same cadence as before); it's what lambda DOES that changed.
+
+  Caps removed (per hybrid recommendation): lambda is clamped only to
+  [0.0, 1.0], no special-cased top-5-layers-only-get-1.0 rule. Trusting the
+  agent + auto-decay to prevent any runaway ratchet.
+
 Components:
   - format_observation()     : builds the structured prompt from metrics
-  - call_groq_agent()      : Groq API call with retry/backoff
-  - parse_agent_response()   : JSON extraction with full fallback chain
+  - call_groq_agent()         : Groq API call with retry/backoff
+  - parse_agent_response()    : JSON extraction with full fallback chain
 
 Agent contract:
   INPUT : observation string (metrics + reflexion memory)
@@ -50,20 +65,21 @@ A base LLM (Qwen2.5-1.5B-Instruct) is being fine-tuned on a task dataset. Fine-t
 
 The ideal λ configuration is the MINIMUM constraint that keeps safety stable. Over-constraining (λ too high everywhere) hurts task learning without additional safety benefit. Under-constraining (λ too low on high-alignment layers) lets safety drift through.
 
-HOW GRADIENT CONSTRAINT WORKS:
-- Each transformer layer (0–27) has a constraint strength λ ∈ [0.0, 1.0].
+HOW THE CONSTRAINT ACTUALLY WORKS (continuous penalty, not a one-time fix):
+- Each transformer layer (0-27) has a constraint strength λ ∈ [0.0, 1.0].
+- Every SINGLE training step, an extra penalty term is added to the loss for each layer: penalty_l = λ_l × (how much of that layer's weight update points toward the unsafe direction)^2.
+- This means λ continuously steers training away from the unsafe direction every step, not just at checkpoints — checkpoints are only when YOU get to change λ, not when the constraint itself is applied.
 - λ = 0.0: NO constraint — maximum task learning, no safety protection
 - λ = 0.3: light constraint — good for low-alignment layers
 - λ = 0.5: moderate constraint
 - λ = 0.7: strong constraint — use for high-alignment layers showing drift
-- λ = 1.0: maximum constraint — layer is fully projected out of safety subspace
-- Constraint formula: ΔW_safe = ΔW - λ × (ΔW @ P)
+- λ = 1.0: maximum constraint
 - Higher subspace alignment score = that layer drifts more = needs higher λ
 - IMPORTANT: λ values AUTO-DECAY by 2% each checkpoint toward 0. If you don't actively set a layer's λ, it gradually returns toward 0. This is intentional — you must justify maintaining high constraints.
-- NOTE: λ is capped at 0.90 for most layers. Only the top-5 layers by alignment score can reach up to 1.0.
+- There is no fixed cap — you may set any layer up to 1.0 if you believe it needs it.
 
 STRATEGY PRINCIPLES:
-1. USE SMOOTHED REFUSAL (3-step average) for decisions, NOT raw refusal. Raw refusal has ±10% noise from small sample evaluation.
+1. USE SMOOTHED REFUSAL (3-step average) for decisions, NOT raw refusal. Raw refusal has +/-10% noise from small sample evaluation.
 2. TARGET LAYERS SELECTIVELY: The agent's advantage over static methods is PRECISION. Set λ=0 on layers with near-zero alignment, and concentrate constraint on the few layers with high alignment. This maximizes task learning while protecting safety.
 3. ACTIVELY REDUCE λ WHEN SAFE: If smoothed refusal is ABOVE the target floor, you MUST actively lower λ on layers with low/medium alignment to boost task learning. This is your KEY advantage over static controllers that only increase constraints.
 4. If smoothed refusal is NEAR the target floor (within 5%): raise λ moderately (+0.10 to +0.20) on the top-5 alignment layers.
@@ -82,7 +98,7 @@ RESPOND WITH VALID JSON ONLY. No text outside the JSON block. Required format:
     "LAYER_IDX_AS_STRING": LAMBDA_VALUE_AS_FLOAT,
     ...
   },
-  "rationale": "1–2 sentence explanation of your decision",
+  "rationale": "1-2 sentence explanation of your decision",
   "predicted_outcome": "Brief prediction for the next 100 steps"
 }"""
 
@@ -129,7 +145,7 @@ def format_observation(
     """
     pct_done   = 100.0 * step / total_steps
     step_change = refusal_rate - prev_refusal_rate
-    
+
     # Dynamically compute target window based on the dataset's initial drift characteristics
     target_floor = max(0.0, baseline_refusal_rate - 0.05)
 
@@ -139,7 +155,7 @@ def format_observation(
     for r in recent_records:
         if r.get("refusal_change", 0) < -0.02:
             declining_steps += 1
-    
+
     # Sort layers by alignment descending
     sorted_layers = sorted(
         [(int(l), float(a)) for l, a in alignments.items()],
@@ -149,32 +165,32 @@ def format_observation(
 
     # Use smoothed refusal as the primary decision metric
     primary_refusal = smoothed_refusal_rate if smoothed_refusal_rate is not None else refusal_rate
-    
+
     lines = [
         "=== LoRA-SafeLoop Agent Observation ===",
         f"Training Progress : Step {step} / {total_steps} ({pct_done:.1f}%)",
         f"Fine-tuning Task  : {task}",
         "",
-        "SAFETY METRICS (use SMOOTHED for decisions, raw is noisy ±10%):",
+        "SAFETY METRICS (use SMOOTHED for decisions, raw is noisy +/-10%):",
         f"  Target Refusal Floor  : {target_floor:.4f} ({target_floor*100:.1f}%) — STAY ABOVE THIS",
     ]
     if smoothed_refusal_rate is not None:
-        lines.append(f"  ★ Smoothed Refusal (3-step avg): {smoothed_refusal_rate:.4f} ({smoothed_refusal_rate*100:.1f}%) ← USE THIS FOR DECISIONS")
+        lines.append(f"  * Smoothed Refusal (3-step avg): {smoothed_refusal_rate:.4f} ({smoothed_refusal_rate*100:.1f}%) <- USE THIS FOR DECISIONS")
     lines += [
         f"  Raw Refusal (noisy)   : {refusal_rate:.4f} ({refusal_rate*100:.1f}%)",
         f"  Baseline              : {baseline_refusal_rate:.4f} ({baseline_refusal_rate*100:.1f}%)",
         f"  Raw Change vs Last    : {step_change:+.4f} ({step_change*100:+.1f}%)",
     ]
-    
+
     # Add warnings based on SMOOTHED refusal, not raw
     if primary_refusal < target_floor:
-        lines.append(f"  ⚠ ALERT: Smoothed refusal {primary_refusal:.2f} is BELOW target floor {target_floor:.2f}. Raise λ aggressively on high-alignment layers.")
+        lines.append(f"  ALERT: Smoothed refusal {primary_refusal:.2f} is BELOW target floor {target_floor:.2f}. Raise λ aggressively on high-alignment layers.")
     elif primary_refusal > target_floor + 0.05:
-        lines.append(f"  ✔ SAFE: Smoothed refusal {primary_refusal:.2f} is comfortably above target floor. YOU MUST ACTIVELY REDUCE λ ON LOW-ALIGNMENT LAYERS TO IMPROVE TASK LEARNING.")
-        
+        lines.append(f"  SAFE: Smoothed refusal {primary_refusal:.2f} is comfortably above target floor. YOU MUST ACTIVELY REDUCE λ ON LOW-ALIGNMENT LAYERS TO IMPROVE TASK LEARNING.")
+
     if declining_steps >= 2:
-        lines.append(f"  ⚠ TREND: Refusal has been DECLINING for {declining_steps} of the last {len(recent_records)} steps.")
-    
+        lines.append(f"  TREND: Refusal has been DECLINING for {declining_steps} of the last {len(recent_records)} steps.")
+
     lines += [
         "",
         "TASK METRICS:",
@@ -188,13 +204,13 @@ def format_observation(
         lam = lambda_state.get(layer_idx, 0.0)
 
         if align > 0.10:
-            flag = "⚠ HIGH — needs λ≥0.7"
+            flag = "HIGH — needs λ>=0.7"
         elif align > 0.05:
-            flag = "↗ MED — needs λ≥0.5"
+            flag = "MED — needs λ>=0.5"
         elif align > 0.02:
-            flag = "  LOW — λ=0.2-0.3 ok"
+            flag = "LOW — λ=0.2-0.3 ok"
         else:
-            flag = "  MIN — λ=0.0 ok"
+            flag = "MIN — λ=0.0 ok"
 
         lines.append(
             f"  Layer {layer_idx:2d} | align={align:.4f} | λ={lam:.3f}  [{flag}]"
@@ -217,7 +233,7 @@ def format_observation(
         "- λ auto-decays 2% each step. You must actively set layers you want to keep high.",
         "- DUAL OBJECTIVE: maintain safety AND maximize task performance.",
         "- If safety is stable: LOWER λ on low-alignment layers to improve task learning. Do NOT just keep raising λ.",
-        "- Make small adjustments (±0.05 to ±0.15). Large jumps destabilize training.",
+        "- Make small adjustments (+/-0.05 to +/-0.15). Large jumps destabilize training.",
     ]
 
     return "\n".join(lines)
@@ -259,7 +275,7 @@ def call_groq_agent(
                     {"role": "system", "content": AGENT_SYSTEM_PROMPT},
                     {"role": "user", "content": observation}
                 ],
-                temperature=0.1, # small non-zero for mild exploration while still structured
+                temperature=0.1,  # small non-zero for mild exploration while still structured
                 max_tokens=512,
             )
             text = response.choices[0].message.content
@@ -320,9 +336,10 @@ def parse_agent_response(
         3. λ value outside [0, 1]                 → clamp to [0,1] + log warning (still use it)
         4. Layer ID not in model                   → skip that key + log warning
 
-    Dynamic λ cap: Most layers capped at 0.90. Top-5 layers by alignment
-    score can go up to 1.0. This prevents the monotonic ratchet to λ=1.0
-    everywhere that kills task learning.
+    No dynamic cap anymore (v4): every layer can be set anywhere in [0.0, 1.0].
+    Auto-decay (applied in run_agent.py before this is called) is the only
+    safeguard against runaway lambda — trusting the agent's own judgment for
+    the rest, per hybrid recommendation.
 
     All fallback events are logged to failure_log_path for paper analysis.
 
@@ -331,7 +348,7 @@ def parse_agent_response(
         current_lambda_state: Current per-layer λ values to use as fallback baseline
         valid_layer_ids: List of valid integer layer indices
         failure_log_path: Optional CSV path for failure logging
-        alignments: Optional dict layer_idx -> alignment score for dynamic λ cap
+        alignments: Unused in v4 (kept in signature for call-site compatibility)
 
     Returns:
         dict with keys:
@@ -427,33 +444,10 @@ def parse_agent_response(
             logger.warning(f"Invalid λ value '{val}' for layer {layer_idx} — skipping.")
             continue
 
-        # Case 3: clamp with dynamic cap based on alignment rank
-        LAMBDA_FLOOR = 0.0
-        
-        # Determine cap for this layer: top-5 alignment layers get 1.0, rest get 0.90
-        LAMBDA_CAP_DEFAULT = 0.90
-        LAMBDA_CAP_TOP = 1.0
-        TOP_N = 5
-        
-        layer_cap = LAMBDA_CAP_DEFAULT
-        if alignments:
-            sorted_by_align = sorted(
-                alignments.items(),
-                key=lambda x: float(x[1]),
-                reverse=True,
-            )
-            top_layer_ids = {int(l) for l, _ in sorted_by_align[:TOP_N]}
-            if layer_idx in top_layer_ids:
-                layer_cap = LAMBDA_CAP_TOP
-        else:
-            layer_cap = LAMBDA_CAP_TOP  # no alignment info → allow full range
-        
-        clamped = max(LAMBDA_FLOOR, min(layer_cap, lam))
+        # Case 3: clamp to [0, 1] only — no dynamic cap (v4)
+        clamped = max(0.0, min(1.0, lam))
         if abs(clamped - lam) > 1e-6:
-            logger.warning(
-                f"λ={lam:.4f} for layer {layer_idx} clamped to {clamped:.4f} "
-                f"(cap={layer_cap:.2f})."
-            )
+            logger.warning(f"λ={lam:.4f} for layer {layer_idx} clamped to {clamped:.4f}.")
         new_lambda_state[layer_idx] = clamped
 
     # ------------------------------------------------------------------

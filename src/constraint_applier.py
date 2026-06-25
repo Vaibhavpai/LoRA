@@ -1,18 +1,41 @@
 """
-constraint_applier.py — Phase 6 (Hybrid v3)
-===========================================
-Applies soft weight-space projection to ΔW=B@A at each evaluation step.
+constraint_applier.py — Phase 6 (v4 — continuous soft penalty)
+=================================================================
+Replaces the periodic SVD weight-projection (v2/v3) with a continuous
+auxiliary loss term, added to the task loss on EVERY training step.
 
-This replaces the previous gradient hook mechanism. By operating on ΔW directly,
-we correctly constrain the exact quantity the subspace alignment metric measures,
-preventing drift via lora_B which was previously unconstrained.
+Why this change: v2/v3 paused every 100 steps and hard-projected ΔW=B@A
+away from the unsafe subspace, then let the model train completely
+unconstrained for the next 99 steps. That created a sawtooth pattern —
+drift, get yanked back, drift again — which is a likely contributor to
+noisy refusal_rate across runs.
 
-Soft projection formula (generalizes baselines.project_lora_layer):
-    ΔW_safe = ΔW - lambda_l * (ΔW @ P_l)
-    P_l = U_l @ U_l.T
+v4 instead adds a differentiable penalty term every step:
 
-lambda_l = 1.0 reproduces SafeLoRA-B exactly for that layer.
-lambda_l = 0.0 leaves that layer fully untouched (vanilla).
+    ΔW_l        = B_l @ A_l                      (this layer's weight update, WITH grad)
+    P_l         = U_l @ U_l^T                    (safety-subspace projector, fixed)
+    penalty_l   = λ_l * || ΔW_l @ P_l ||_F^2      (squared norm of the unsafe-direction component)
+    total_loss  = task_loss + penalty_scale * sum_l(penalty_l)
+
+Backprop through this penalty nudges lora_A/lora_B away from the unsafe
+direction continuously, instead of correcting after the fact. No SVD,
+no re-factoring, no in-place weight surgery — purely an added loss term.
+
+lambda_l still only changes at eval checkpoints (same cadence as before,
+same agent/reflexion loop) — only WHAT lambda multiplies has changed.
+
+Usage:
+    from src.constraint_applier import ConstraintApplier
+
+    applier = ConstraintApplier(model, safety_directions, device)
+    ...
+    # every training step, before loss.backward():
+    penalty = applier.compute_penalty()
+    loss = task_loss + args.penalty_scale * penalty
+    loss.backward()
+    ...
+    # every eval_every steps, after agent decides:
+    applier.set_all_lambdas(new_lambdas)   # no apply_projection() call needed anymore
 """
 
 import logging
@@ -25,8 +48,8 @@ PROJ_NAMES = ("q_proj", "v_proj")
 
 class ConstraintApplier:
     """
-    Holds per-layer lambda + projection matrices, and applies soft
-    weight-space projection to ΔW=B@A on demand (call apply_projection()).
+    Holds per-layer lambda + fixed projection matrices, and computes a
+    differentiable penalty term every step (no weight surgery).
     """
 
     def __init__(self, model, safety_directions: dict, device: str, initial_lambda: float = 0.0):
@@ -43,7 +66,7 @@ class ConstraintApplier:
             P_l = (U @ U.T).detach().requires_grad_(False)
             self.proj_matrices[l] = P_l
 
-        logger.info(f"ConstraintApplier (weight-space) initialized for {len(self.layer_indices)} layers.")
+        logger.info(f"ConstraintApplier (v4, continuous penalty) initialized for {len(self.layer_indices)} layers.")
 
     def set_lambda(self, layer_idx: int, value: float):
         self.lambdas[layer_idx] = max(0.0, min(1.0, value))
@@ -56,60 +79,75 @@ class ConstraintApplier:
             else:
                 logger.warning(f"set_all_lambdas: layer {l} not tracked, ignored.")
 
+    def decay_lambdas(self, rate: float = 0.98):
+        """Call once per eval checkpoint, before the agent observes state."""
+        for l in self.lambdas:
+            self.lambdas[l] = max(0.0, self.lambdas[l] * rate)
+
     def get_lambdas(self) -> dict:
         return dict(self.lambdas)
 
-    def _project_one_layer(self, layer_idx: int, proj_name: str, P: torch.Tensor, lam: float) -> bool:
-        """Soft version of baselines.project_lora_layer — same math, scaled by lam."""
-        try:
-            layer = self.model.base_model.model.model.layers[layer_idx]
-            proj = getattr(layer.self_attn, proj_name)
-            lora_A = proj.lora_A.default.weight
-            lora_B = proj.lora_B.default.weight
-        except AttributeError:
-            return False
-
-        if lam <= 0.0:
-            return False  # no-op, leave weights untouched
-
-        r = lora_A.shape[0]
-        orig_dtype = lora_A.dtype
-        dev = lora_A.device
-        P_dev = P.to(dev)
-
-        with torch.no_grad():
-            A = lora_A.detach().to(torch.float32)
-            B = lora_B.detach().to(torch.float32)
-
-            delta_W = B @ A
-            delta_W_safe = delta_W - lam * (delta_W @ P_dev)  # SOFT projection, scaled by lambda
-
-            U_svd, S_svd, Vh_svd = torch.linalg.svd(delta_W_safe, full_matrices=False)
-            U_r = U_svd[:, :r]
-            S_r = S_svd[:r]
-            Vh_r = Vh_svd[:r, :]
-
-            sqrt_S = torch.sqrt(S_r.clamp(min=0.0))
-            new_B = U_r * sqrt_S.unsqueeze(0)
-            new_A = sqrt_S.unsqueeze(1) * Vh_r
-
-            lora_B.data.copy_(new_B.to(orig_dtype))
-            lora_A.data.copy_(new_A.to(orig_dtype))
-
-        return True
-
-    def apply_projection(self) -> int:
+    def compute_penalty(self) -> torch.Tensor:
         """
-        Call this AFTER agent.decide() + set_all_lambdas(), every eval_every
-        steps. Projects ΔW for every tracked layer using its current lambda.
-        Returns number of (layer, proj) pairs actually modified (lam>0).
+        Differentiable. Call every training step, BEFORE loss.backward().
+        Returns a scalar tensor (0.0 tensor if every tracked lambda is 0,
+        in which case no layers are even visited — cheap no-op path).
         """
-        n_applied = 0
+        any_active = any(v > 0.0 for v in self.lambdas.values())
+        if not any_active:
+            return torch.zeros((), device=self.device)
+
+        penalty = torch.zeros((), device=self.device)
         for layer_idx in self.layer_indices:
             lam = self.lambdas.get(layer_idx, 0.0)
+            if lam <= 0.0:
+                continue
+
             P = self.proj_matrices[layer_idx]
+
             for proj_name in PROJ_NAMES:
-                if self._project_one_layer(layer_idx, proj_name, P, lam):
-                    n_applied += 1
-        logger.info(f"Weight-space projection applied to {n_applied} (layer, proj) pairs.")
-        return n_applied
+                try:
+                    layer = self.model.base_model.model.model.layers[layer_idx]
+                    proj = getattr(layer.self_attn, proj_name)
+                    lora_A = proj.lora_A.default.weight  # [r, d_in], requires_grad=True
+                    lora_B = proj.lora_B.default.weight  # [d_out, r], requires_grad=True
+                except AttributeError:
+                    continue
+
+                # Cast to fp32 for stable penalty computation; cast preserves autograd.
+                A = lora_A.float()
+                B = lora_B.float()
+                delta_W = B @ A                              # [d_out, d_in], WITH grad
+                P_dev = P.to(delta_W.device)
+                unsafe_component = delta_W @ P_dev            # [d_out, d_in]
+                penalty = penalty + lam * (unsafe_component ** 2).sum()
+
+        return penalty
+
+    @torch.no_grad()
+    def measure_alignment_ratio(self) -> dict:
+        """
+        Optional diagnostic, separate from metrics.compute_subspace_alignment
+        (kept for parity/debugging — main alignment metric used for the
+        agent's observation still comes from src/metrics.py).
+        Returns dict[layer_idx -> float] of ||ΔW@P|| / ||ΔW|| per layer.
+        """
+        ratios = {}
+        for layer_idx in self.layer_indices:
+            P = self.proj_matrices[layer_idx]
+            layer_ratios = []
+            for proj_name in PROJ_NAMES:
+                try:
+                    layer = self.model.base_model.model.model.layers[layer_idx]
+                    proj = getattr(layer.self_attn, proj_name)
+                    A = proj.lora_A.default.weight.detach().float()
+                    B = proj.lora_B.default.weight.detach().float()
+                except AttributeError:
+                    continue
+                delta_W = B @ A
+                proj_component = delta_W @ P.to(delta_W.device)
+                ratio = proj_component.norm().item() / (delta_W.norm().item() + 1e-9)
+                layer_ratios.append(ratio)
+            if layer_ratios:
+                ratios[layer_idx] = sum(layer_ratios) / len(layer_ratios)
+        return ratios
