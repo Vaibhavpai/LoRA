@@ -57,7 +57,7 @@ def main():
     parser.add_argument("--steps",   type=int, default=2000)
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--lr",      type=float, default=2e-4)
-    parser.add_argument("--penalty_scale", type=float, default=0.01,
+    parser.add_argument("--penalty_scale", type=float, default=1.0,
                         help="Global scale on the safety penalty term added to the task loss every step.")
     parser.add_argument("--lambda_decay_rate", type=float, default=0.98,
                         help="Per-checkpoint multiplicative decay applied to lambda before the agent observes state.")
