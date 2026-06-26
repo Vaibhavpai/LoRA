@@ -144,8 +144,16 @@ def main():
 
     controller = SimpleAdaptiveController(initial_lambda=initial_lambda, delta=0.05)
     
-    # Initialize a shared mutable dictionary for the hooks
-    lambda_state = {int(layer_idx): controller.current_lambda for layer_idx in safety_directions.keys()}
+    # Initialize a shared mutable dictionary for the hooks (int layer keys)
+    # Extract unique layer indices from string-keyed directions
+    layer_indices = set()
+    for key in safety_directions.keys():
+        key_str = str(key)
+        if "." in key_str:
+            layer_indices.add(int(key_str.split(".")[0]))
+        else:
+            layer_indices.add(int(key_str))
+    lambda_state = {l: controller.current_lambda for l in sorted(layer_indices)}
     
     # Register the backward hooks on lora_A
     hook_handles = register_gradient_hooks(model, safety_directions, lambda_state, device)

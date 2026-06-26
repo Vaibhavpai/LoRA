@@ -1,42 +1,23 @@
 """
-agent.py — Phase 6, Steps 6.2-6.3
-====================================
+agent.py — Phase 6 (v4.1, per-projection)
+============================================
 LLM-based training controller for LoRA-SafeLoop.
 
-v4 update (continuous soft penalty mechanism):
-  Constraint is no longer a periodic SVD weight-projection. Instead, every
-  per-layer lambda controls the WEIGHT of an auxiliary loss term added every
-  single training step:
-      penalty = sum_l  lambda_l * || (B_l @ A_l) @ P_l ||_F^2
-      total_loss = task_loss + penalty_scale * penalty
-  Gradient descent then continuously steers ΔW away from the unsafe
-  subspace, instead of drifting freely for 99 steps and getting yanked back
-  by a hard projection every 100th step. Lambda still only changes at eval
-  checkpoints (same cadence as before); it's what lambda DOES that changed.
-
-  Caps removed (per hybrid recommendation): lambda is clamped only to
-  [0.0, 1.0], no special-cased top-5-layers-only-get-1.0 rule. Trusting the
-  agent + auto-decay to prevent any runaway ratchet.
-
-Components:
-  - format_observation()     : builds the structured prompt from metrics
-  - call_groq_agent()         : Groq API call with retry/backoff
-  - parse_agent_response()    : JSON extraction with full fallback chain
+v4.1 changes from v4:
+  - Observation shows per-projection alignment (q/v separate) but agent still
+    decides per-LAYER (28 decisions). Lambda is split equally to q_proj and
+    v_proj within each layer by the parser — keeps the LLM's action space
+    manageable while the constraint operates per-projection.
+  - Internal state uses string keys ("24.q_proj", "24.v_proj").
+  - System prompt updated for per-projection context.
 
 Agent contract:
   INPUT : observation string (metrics + reflexion memory)
   OUTPUT: {
-    "layer_constraints": {"24": 0.8, "22": 0.7, ...},   // only layers to CHANGE
+    "layer_constraints": {"24": 0.8, "22": 0.7, ...},  // per-LAYER, split to q/v
     "rationale": "...",
     "predicted_outcome": "..."
   }
-
-Fallback chain (in order):
-  1. API call fails / no key  → keep current λ values
-  2. JSON malformed           → keep current λ values
-  3. λ out of [0,1]           → clamp to [0,1] + log warning
-  4. Unknown layer ID         → ignore that key + log warning
-All failures logged to agent_failures.csv for paper analysis.
 """
 
 import csv
@@ -63,34 +44,25 @@ A base LLM (Qwen2.5-1.5B-Instruct) is being fine-tuned on a task dataset. Fine-t
   1. MAINTAIN refusal rate above the target floor (baseline - 5%) — safety must not erode
   2. MAXIMIZE task performance (lower loss for Alpaca, higher accuracy for GSM8K)
 
-The ideal λ configuration is the MINIMUM constraint that keeps safety stable. Over-constraining (λ too high everywhere) hurts task learning without additional safety benefit. Under-constraining (λ too low on high-alignment layers) lets safety drift through.
+The ideal λ configuration is the MINIMUM constraint that keeps safety stable.
 
-HOW THE CONSTRAINT ACTUALLY WORKS (continuous penalty, not a one-time fix):
-- Each transformer layer (0-27) has a constraint strength λ ∈ [0.0, 1.0].
-- Every SINGLE training step, an extra penalty term is added to the loss for each layer: penalty_l = λ_l × (how much of that layer's weight update points toward the unsafe direction)^2.
-- This means λ continuously steers training away from the unsafe direction every step, not just at checkpoints — checkpoints are only when YOU get to change λ, not when the constraint itself is applied.
-- λ = 0.0: NO constraint — maximum task learning, no safety protection
-- λ = 0.3: light constraint — good for low-alignment layers
-- λ = 0.5: moderate constraint
-- λ = 0.7: strong constraint — use for high-alignment layers showing drift
-- λ = 1.0: maximum constraint
-- Higher subspace alignment score = that layer drifts more = needs higher λ
-- IMPORTANT: λ values AUTO-DECAY by 2% each checkpoint toward 0. If you don't actively set a layer's λ, it gradually returns toward 0. This is intentional — you must justify maintaining high constraints.
-- There is no fixed cap — you may set any layer up to 1.0 if you believe it needs it.
+HOW THE CONSTRAINT WORKS (continuous penalty, per-projection):
+- Each transformer layer (0-27) has TWO constraint strengths: one for q_proj, one for v_proj.
+- You set lambda PER LAYER — it is applied equally to both q_proj and v_proj in that layer.
+- Every training step, a penalty is added: penalty = λ × (how much the weight update points toward the unsafe direction)².
+- λ = 0.0: NO constraint. λ = 0.3: light. λ = 0.5: moderate. λ = 0.7: strong. λ = 1.0: maximum.
+- λ values AUTO-DECAY by 2% each checkpoint toward 0.
+
+In the observation, you will see per-projection alignment scores (q_align, v_align). These show how much each projection's weight update aligns with the unsafe direction. Use these to decide which layers need the most constraint.
 
 STRATEGY PRINCIPLES:
-1. USE SMOOTHED REFUSAL (3-step average) for decisions, NOT raw refusal. Raw refusal has +/-10% noise from small sample evaluation.
-2. TARGET LAYERS SELECTIVELY: The agent's advantage over static methods is PRECISION. Set λ=0 on layers with near-zero alignment, and concentrate constraint on the few layers with high alignment. This maximizes task learning while protecting safety.
-3. ACTIVELY REDUCE λ WHEN SAFE: If smoothed refusal is ABOVE the target floor, you MUST actively lower λ on layers with low/medium alignment to boost task learning. This is your KEY advantage over static controllers that only increase constraints.
+1. USE SMOOTHED REFUSAL (3-step average) for decisions, NOT raw refusal.
+2. TARGET LAYERS SELECTIVELY: Set λ=0 on layers with near-zero alignment. Concentrate on layers with high alignment.
+3. ACTIVELY REDUCE λ WHEN SAFE: If smoothed refusal is ABOVE the target floor, lower λ on low-alignment layers.
 4. If smoothed refusal is NEAR the target floor (within 5%): raise λ moderately (+0.10 to +0.20) on the top-5 alignment layers.
 5. If smoothed refusal is BELOW the target floor: raise λ aggressively on the top-10 alignment layers (to 0.7-0.9).
-6. Learn from reflexion memory: if raising λ uniformly produced DEGRADATION (safety got worse despite higher λ), the drift is in directions P doesn't capture, or you constrained the wrong layers.
-7. Make PROPORTIONAL adjustments. Layers with alignment >0.1 should have higher λ. Layers with alignment <0.02 can stay at λ=0.
-
-CRITICAL RULES:
-- You only need to specify layers you want to CHANGE. Unspecified layers keep current λ (after auto-decay).
-- λ=0 is valid and preferred for low-alignment layers when safety is stable.
-- Aim for STABILITY, not perfection. Small consistent improvements beat large swings.
+6. Learn from reflexion memory: if a strategy produced DEGRADATION, avoid repeating it.
+7. Make PROPORTIONAL adjustments based on alignment scores.
 
 RESPOND WITH VALID JSON ONLY. No text outside the JSON block. Required format:
 {
@@ -123,47 +95,52 @@ def format_observation(
     top_k_layers: int = 10,
 ) -> str:
     """
-    Builds a structured observation string for the Groq agent.
+    Builds a structured observation string for the agent.
+
+    v4.1: alignments and lambda_state use string keys ("{layer}.{proj}").
+    The observation aggregates per-projection info into per-layer rows for readability.
 
     Args:
-        step: Current training step
-        total_steps: Total training steps planned
-        task: 'gsm8k' or 'alpaca'
-        refusal_rate: RAW refusal rate just measured (not smoothed)
-        prev_refusal_rate: Refusal rate at previous checkpoint
-        baseline_refusal_rate: Refusal rate when tracking began (step 100)
-        task_metric: Task accuracy or val loss
-        metric_name: Name of the task metric
-        alignments: dict layer_idx -> alignment score
-        lambda_state: dict layer_idx -> current lambda
-        reflexion_memory: ReflexionMemory instance
-        smoothed_refusal_rate: Optional smoothed refusal (3-step moving average)
-        top_k_layers: How many layers to show in detail (sorted by alignment)
-
-    Returns:
-        Formatted observation string
+        alignments: dict "{layer}.{proj}" -> alignment score
+        lambda_state: dict "{layer}.{proj}" -> current lambda
+        (other args unchanged)
     """
-    pct_done   = 100.0 * step / total_steps
+    pct_done = 100.0 * step / total_steps
     step_change = refusal_rate - prev_refusal_rate
 
-    # Dynamically compute target window based on the dataset's initial drift characteristics
     target_floor = max(0.0, baseline_refusal_rate - 0.05)
 
-    # Detect declining trend from reflexion memory
+    # Detect declining trend
     recent_records = reflexion_memory.get_recent(3)
     declining_steps = 0
     for r in recent_records:
         if r.get("refusal_change", 0) < -0.02:
             declining_steps += 1
 
-    # Sort layers by alignment descending
+    # Aggregate per-projection data into per-layer
+    layer_data = {}
+    for key in sorted(alignments.keys()):
+        parts = key.split(".")
+        layer_idx = int(parts[0])
+        proj_name = parts[1]
+
+        if layer_idx not in layer_data:
+            layer_data[layer_idx] = {"q_align": 0.0, "v_align": 0.0, "q_lam": 0.0, "v_lam": 0.0}
+
+        if proj_name == "q_proj":
+            layer_data[layer_idx]["q_align"] = float(alignments[key])
+            layer_data[layer_idx]["q_lam"] = float(lambda_state.get(key, 0.0))
+        elif proj_name == "v_proj":
+            layer_data[layer_idx]["v_align"] = float(alignments[key])
+            layer_data[layer_idx]["v_lam"] = float(lambda_state.get(key, 0.0))
+
+    # Sort by max alignment descending
     sorted_layers = sorted(
-        [(int(l), float(a)) for l, a in alignments.items()],
-        key=lambda x: x[1],
+        layer_data.items(),
+        key=lambda x: max(x[1]["q_align"], x[1]["v_align"]),
         reverse=True,
     )
 
-    # Use smoothed refusal as the primary decision metric
     primary_refusal = smoothed_refusal_rate if smoothed_refusal_rate is not None else refusal_rate
 
     lines = [
@@ -182,11 +159,10 @@ def format_observation(
         f"  Raw Change vs Last    : {step_change:+.4f} ({step_change*100:+.1f}%)",
     ]
 
-    # Add warnings based on SMOOTHED refusal, not raw
     if primary_refusal < target_floor:
-        lines.append(f"  ALERT: Smoothed refusal {primary_refusal:.2f} is BELOW target floor {target_floor:.2f}. Raise λ aggressively on high-alignment layers.")
+        lines.append(f"  ALERT: Smoothed refusal {primary_refusal:.2f} is BELOW target floor {target_floor:.2f}. Raise λ aggressively.")
     elif primary_refusal > target_floor + 0.05:
-        lines.append(f"  SAFE: Smoothed refusal {primary_refusal:.2f} is comfortably above target floor. YOU MUST ACTIVELY REDUCE λ ON LOW-ALIGNMENT LAYERS TO IMPROVE TASK LEARNING.")
+        lines.append(f"  SAFE: Smoothed refusal {primary_refusal:.2f} is above target floor. REDUCE λ on low-alignment layers.")
 
     if declining_steps >= 2:
         lines.append(f"  TREND: Refusal has been DECLINING for {declining_steps} of the last {len(recent_records)} steps.")
@@ -197,33 +173,42 @@ def format_observation(
         f"  {metric_name}: {task_metric:.4f}",
         "",
         f"TOP {min(top_k_layers, len(sorted_layers))} LAYERS BY SUBSPACE ALIGNMENT",
-        "(Higher alignment = more safety drift = needs stronger constraint):",
+        "(Per-projection: q=q_proj, v=v_proj. Higher alignment = needs stronger λ):",
     ]
 
-    for layer_idx, align in sorted_layers[:top_k_layers]:
-        lam = lambda_state.get(layer_idx, 0.0)
+    for layer_idx, data in sorted_layers[:top_k_layers]:
+        max_align = max(data["q_align"], data["v_align"])
+        avg_lam = (data["q_lam"] + data["v_lam"]) / 2
 
-        if align > 0.10:
+        if max_align > 0.10:
             flag = "HIGH — needs λ>=0.7"
-        elif align > 0.05:
+        elif max_align > 0.05:
             flag = "MED — needs λ>=0.5"
-        elif align > 0.02:
+        elif max_align > 0.02:
             flag = "LOW — λ=0.2-0.3 ok"
         else:
             flag = "MIN — λ=0.0 ok"
 
         lines.append(
-            f"  Layer {layer_idx:2d} | align={align:.4f} | λ={lam:.3f}  [{flag}]"
+            f"  Layer {layer_idx:2d} | q_align={data['q_align']:.4f} v_align={data['v_align']:.4f} "
+            f"| λ={avg_lam:.3f}  [{flag}]"
         )
 
-    # Compact full lambda state
+    # Compact full lambda state (per-layer average)
+    layer_lam_avg = {}
+    for key, lam in lambda_state.items():
+        layer_idx = int(str(key).split(".")[0])
+        if layer_idx not in layer_lam_avg:
+            layer_lam_avg[layer_idx] = []
+        layer_lam_avg[layer_idx].append(lam)
     lambda_compact = " ".join(
-        f"{l}:{v:.2f}"
-        for l, v in sorted(lambda_state.items(), key=lambda x: int(x[0]))
+        f"{l}:{sum(vs)/len(vs):.2f}"
+        for l, vs in sorted(layer_lam_avg.items())
     )
+
     lines += [
         "",
-        f"FULL λ STATE (after 2% auto-decay): [{lambda_compact}]",
+        f"FULL λ STATE (per-layer avg, after 2% auto-decay): [{lambda_compact}]",
         "",
         "REFLEXION MEMORY (last completed decisions and their outcomes):",
         reflexion_memory.format_for_agent(),
@@ -232,7 +217,7 @@ def format_observation(
         "- Use SMOOTHED refusal for decisions, not raw.",
         "- λ auto-decays 2% each step. You must actively set layers you want to keep high.",
         "- DUAL OBJECTIVE: maintain safety AND maximize task performance.",
-        "- If safety is stable: LOWER λ on low-alignment layers to improve task learning. Do NOT just keep raising λ.",
+        "- If safety is stable: LOWER λ on low-alignment layers to improve task learning.",
         "- Make small adjustments (+/-0.05 to +/-0.15). Large jumps destabilize training.",
     ]
 
@@ -252,18 +237,7 @@ def call_groq_agent(
 ) -> Optional[str]:
     """
     Calls the Groq API with the observation and returns the raw response text.
-
     Uses exponential backoff on rate-limit errors.
-
-    Args:
-        observation: Formatted observation string
-        api_key: Groq API key
-        model_id: Groq model to use
-        max_retries: Retry attempts before giving up
-        base_retry_delay: Initial retry wait time (doubles on each attempt)
-
-    Returns:
-        Raw response text if successful, None if all retries failed
     """
     client = groq.Groq(api_key=api_key)
 
@@ -275,7 +249,7 @@ def call_groq_agent(
                     {"role": "system", "content": AGENT_SYSTEM_PROMPT},
                     {"role": "user", "content": observation}
                 ],
-                temperature=0.1,  # small non-zero for mild exploration while still structured
+                temperature=0.1,
                 max_tokens=512,
             )
             text = response.choices[0].message.content
@@ -300,7 +274,6 @@ def call_groq_agent(
 
         except groq.APIStatusError as e:
             logger.error(f"API status error {e.status_code}: {e.message}")
-            # Don't retry on 4xx client errors (bad request, auth failure)
             if 400 <= e.status_code < 500:
                 break
             time.sleep(base_retry_delay)
@@ -330,55 +303,38 @@ def parse_agent_response(
     """
     Parses the agent's JSON response with a full fallback chain.
 
-    Fallback hierarchy:
-        1. response_text is None (API failed)     → keep current λ
-        2. No valid JSON found in response         → keep current λ
-        3. λ value outside [0, 1]                 → clamp to [0,1] + log warning (still use it)
-        4. Layer ID not in model                   → skip that key + log warning
-
-    No dynamic cap anymore (v4): every layer can be set anywhere in [0.0, 1.0].
-    Auto-decay (applied in run_agent.py before this is called) is the only
-    safeguard against runaway lambda — trusting the agent's own judgment for
-    the rest, per hybrid recommendation.
-
-    All fallback events are logged to failure_log_path for paper analysis.
+    v4.1: Agent outputs per-LAYER keys (int). Parser expands them to
+    per-projection string keys ("24.q_proj", "24.v_proj") for the
+    constraint applier.
 
     Args:
-        response_text: Raw text from Groq API (None if API failed)
-        current_lambda_state: Current per-layer λ values to use as fallback baseline
-        valid_layer_ids: List of valid integer layer indices
-        failure_log_path: Optional CSV path for failure logging
-        alignments: Unused in v4 (kept in signature for call-site compatibility)
+        current_lambda_state: Current per-projection λ values (string-keyed).
+        valid_layer_ids: List of valid integer layer indices.
+        (other args unchanged)
 
     Returns:
         dict with keys:
-            "layer_constraints"        : dict int(layer_idx) -> float  (full updated state)
-            "rationale"                : str
-            "predicted_outcome"        : str
-            "fallback_used"            : bool
+            "layer_constraints"  : dict string key -> float (full updated state)
+            "rationale"          : str
+            "predicted_outcome"  : str
+            "fallback_used"      : bool
     """
-    # Default result: unchanged state
     fallback_result = {
-        "layer_constraints":       dict(current_lambda_state),
-        "rationale":               "[FALLBACK] Keeping current λ values unchanged.",
-        "predicted_outcome":       "Unknown (fallback used — no agent decision).",
-        "fallback_used":           True,
+        "layer_constraints":  dict(current_lambda_state),
+        "rationale":          "[FALLBACK] Keeping current λ values unchanged.",
+        "predicted_outcome":  "Unknown (fallback used).",
+        "fallback_used":      True,
     }
 
-    # ------------------------------------------------------------------
     # Case 1: API returned nothing
-    # ------------------------------------------------------------------
     if response_text is None:
-        logger.warning("Agent response is None — using fallback (no API key or all retries failed).")
+        logger.warning("Agent response is None — using fallback.")
         _log_failure(failure_log_path, "null_response", None)
         return fallback_result
 
-    # ------------------------------------------------------------------
-    # Case 2: Try to extract JSON from response
-    # ------------------------------------------------------------------
+    # Case 2: Extract JSON
     text = response_text.strip()
 
-    # Handle markdown code fences
     if "```json" in text:
         s = text.find("```json") + 7
         e = text.find("```", s)
@@ -388,19 +344,15 @@ def parse_agent_response(
         e = text.find("```", s)
         text = text[s:e].strip() if e != -1 else text[s:].strip()
 
-    # Find outermost { ... }
     brace_start = text.find("{")
-    brace_end   = text.rfind("}")
+    brace_end = text.rfind("}")
     if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
-        text = text[brace_start : brace_end + 1]
+        text = text[brace_start:brace_end + 1]
 
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
-        logger.warning(
-            f"JSON parse failed: {e}\n"
-            f"Response snippet: {response_text[:300]}"
-        )
+        logger.warning(f"JSON parse failed: {e}\nSnippet: {response_text[:300]}")
         _log_failure(failure_log_path, "json_parse_error", response_text)
         return fallback_result
 
@@ -409,63 +361,55 @@ def parse_agent_response(
         _log_failure(failure_log_path, "not_a_dict", response_text)
         return fallback_result
 
-    # ------------------------------------------------------------------
     # Extract layer_constraints
-    # ------------------------------------------------------------------
     raw_constraints = parsed.get("layer_constraints", {})
     if not isinstance(raw_constraints, dict):
-        logger.warning(
-            f"layer_constraints is {type(raw_constraints).__name__}, not dict — fallback."
-        )
+        logger.warning(f"layer_constraints is {type(raw_constraints).__name__} — fallback.")
         _log_failure(failure_log_path, "invalid_constraints_type", response_text)
         return fallback_result
 
-    # Start from current state; agent only needs to specify layers it wants to change
+    # Start from current state
     new_lambda_state = dict(current_lambda_state)
 
     for key, val in raw_constraints.items():
-        # Validate layer index
+        # Agent sends per-layer int keys; expand to per-projection string keys
         try:
             layer_idx = int(key)
         except (ValueError, TypeError):
-            logger.warning(f"Invalid layer key '{key}' (not int) — skipping.")
+            logger.warning(f"Invalid layer key '{key}' — skipping.")
             continue
 
         if layer_idx not in valid_layer_ids:
-            logger.warning(
-                f"Layer {layer_idx} not in model (valid: {valid_layer_ids[:5]}...) — skipping."
-            )
+            logger.warning(f"Layer {layer_idx} not in model — skipping.")
             continue
 
-        # Validate lambda value
         try:
             lam = float(val)
         except (ValueError, TypeError):
             logger.warning(f"Invalid λ value '{val}' for layer {layer_idx} — skipping.")
             continue
 
-        # Case 3: clamp to [0, 1] only — no dynamic cap (v4)
         clamped = max(0.0, min(1.0, lam))
         if abs(clamped - lam) > 1e-6:
             logger.warning(f"λ={lam:.4f} for layer {layer_idx} clamped to {clamped:.4f}.")
-        new_lambda_state[layer_idx] = clamped
 
-    # ------------------------------------------------------------------
+        # Expand to both projections
+        for proj_name in ("q_proj", "v_proj"):
+            full_key = f"{layer_idx}.{proj_name}"
+            if full_key in new_lambda_state:
+                new_lambda_state[full_key] = clamped
+
     # Extract text fields
-    # ------------------------------------------------------------------
-    rationale        = str(parsed.get("rationale", "No rationale provided."))[:300]
+    rationale = str(parsed.get("rationale", "No rationale provided."))[:300]
     predicted_outcome = str(parsed.get("predicted_outcome", "Not specified."))[:200]
 
-    logger.info(
-        f"Agent decision parsed: "
-        f"{len(raw_constraints)} layers updated."
-    )
+    logger.info(f"Agent decision parsed: {len(raw_constraints)} layers updated.")
 
     return {
-        "layer_constraints":       new_lambda_state,
-        "rationale":               rationale,
-        "predicted_outcome":       predicted_outcome,
-        "fallback_used":           False,
+        "layer_constraints":  new_lambda_state,
+        "rationale":          rationale,
+        "predicted_outcome":  predicted_outcome,
+        "fallback_used":      False,
     }
 
 

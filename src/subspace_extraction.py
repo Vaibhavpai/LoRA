@@ -1,33 +1,22 @@
 """
-subspace_extraction.py — Phase 3, Step 3.1
-===========================================
-Extracts the safety subspace directions from the BASE (unmodified) Qwen2.5-1.5B-Instruct
+subspace_extraction.py — Phase 3 (v2, per-projection)
+======================================================
+Extracts safety subspace directions from the BASE Qwen2.5-1.5B-Instruct
 using contrastive activation analysis (following Arditi et al. 2024).
 
-How it works:
-  1. Run 520 harmful AdvBench prompts through the base model → collect last-token
-     hidden states at every transformer layer.
-  2. Run 520 safe prompts through the same model.
-  3. Subtract: difference_vector = harmful_activation - safe_activation per layer.
-  4. Stack all 520 difference vectors into a matrix D_l of shape [520, d_model].
-  5. SVD on D_l → take the top-k RIGHT singular vectors (columns of V).
-     These vectors live in activation space (R^d_model) and capture the
-     "safety vs. unsafe" direction at each layer.
-  6. Save to models/safety_directions.pt as: dict[layer_idx -> tensor[d_model, k]]
+v2 changes from original:
+  - Per-projection subspaces: separate directions for q_proj and v_proj
+    at each layer (56 keys total instead of 28).
+  - Forward hooks capture the actual INPUT to each projection module
+    (post-layernorm), not the residual stream output.
+  - Mean-centering of the difference matrix before SVD.
+  - L2-normalization of extracted direction vectors.
+  - String key format: "{layer_idx}.{proj_name}" (e.g., "0.q_proj").
 
-Audit changelog (Phase 3 audit):
-  - logger.debug → logger.info for variance explained logging (was silently suppressed).
-  - verify_directions replaced with verify_directions_full: now covers ALL layers,
-    reports ALL k directions, and exports a separation statistics CSV.
-  - verify_directions kept as a thin wrapper calling verify_directions_full for
-    backward compatibility with any external callers.
-  - All extraction math UNCHANGED.
-
-⚠️  KNOWN COMPLIANCE ISSUE (flagged, not auto-fixed):
-    Safe prompts are loaded from the AdvBench-Safe dataset
-    using semantically matched harmful/safe pairs. The plan requires:
-      "Load or construct a set of 520 safe paraphrases of AdvBench prompts"
-    See PHASE3_AUDIT_REPORT.md § C for fix options.
+⚠️  KNOWN COMPLIANCE ISSUE (unchanged from v1):
+    Safe prompts are loaded from the AdvBench-Safe dataset using generic
+    safe instructions, NOT true semantic paraphrases of each harmful prompt.
+    See PHASE3_AUDIT_REPORT.md for fix options.
 
 Usage:
   python src/subspace_extraction.py
@@ -52,48 +41,94 @@ from src.dataset_loader import load_advbench, load_safe_prompts
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Target projections — must match LoRA target_modules
+TARGET_PROJECTIONS = ("q_proj", "v_proj")
+
 
 # ===========================================================================
-# Step 1: Collect last-token hidden states for a list of prompts
+# Step 1: Collect per-projection input activations via forward hooks
 # ===========================================================================
 
-def collect_hidden_states(
+class _InputCapture:
+    """Captures the input tensor to a specific projection module."""
+
+    def __init__(self):
+        self.activations: list[torch.Tensor] = []
+        self._hook = None
+
+    def register(self, module: torch.nn.Module):
+        self._hook = module.register_forward_hook(self._hook_fn)
+
+    def _hook_fn(self, module, input_args, output):
+        # input_args[0] shape: [batch, seq_len, d_in]
+        # Take last-token activation (left-padded, so index -1 is always real content)
+        x = input_args[0].detach().float().cpu()
+        last_token = x[:, -1, :]  # [batch, d_in]
+        self.activations.append(last_token)
+
+    def remove(self):
+        if self._hook is not None:
+            self._hook.remove()
+            self._hook = None
+
+    def get_stacked(self) -> Optional[torch.Tensor]:
+        """Returns [N, d_in] tensor of all captured last-token activations."""
+        if not self.activations:
+            return None
+        return torch.cat(self.activations, dim=0)
+
+    def clear(self):
+        self.activations.clear()
+
+
+def collect_projection_inputs(
     model,
     tokenizer,
     prompts: list[str],
     batch_size: int = 8,
     device: str = "cpu",
-) -> dict[int, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """
-    Runs all prompts through the model and collects the LAST-TOKEN hidden state
-    at every transformer layer.
+    Runs all prompts through the model and collects the INPUT activation
+    to each target projection (q_proj, v_proj) at every transformer layer.
 
-    Why last-token only?
-    - Prompts have different lengths, so full sequence tensors can't be stacked.
-    - The last token's hidden state is the model's compressed representation of
-      the entire input — this is exactly what Arditi et al. 2024 use.
-    - We use LEFT padding so that position -1 is always the last real content
-      token (not a pad token).
+    Uses forward hooks on the projection modules themselves, so we capture
+    the post-layernorm activation that the projection actually sees.
 
     Args:
         model      : Loaded HuggingFace model (base, no LoRA).
         tokenizer  : Matching tokenizer.
         prompts    : List of instruction strings.
-        batch_size : How many prompts to process at once. Keep low on CPU.
+        batch_size : How many prompts to process at once.
         device     : 'cpu' or 'cuda'.
 
     Returns:
-        dict mapping layer_idx -> tensor of shape [N, d_model]
-        where N = len(prompts), d_model = hidden size of the model.
+        dict mapping "{layer_idx}.{proj_name}" -> tensor of shape [N, d_in]
+        where N = len(prompts), d_in = hidden size of the model.
     """
     model.eval()
-    num_layers = model.config.num_hidden_layers  # 28 for Qwen2.5-1.5B
+    num_layers = model.config.num_hidden_layers
 
-    layer_states: dict[int, list[torch.Tensor]] = {l: [] for l in range(num_layers)}
+    # Register hooks on all target projections
+    captures: dict[str, _InputCapture] = {}
+    for layer_idx in range(num_layers):
+        layer = model.model.layers[layer_idx]
+        for proj_name in TARGET_PROJECTIONS:
+            proj_module = getattr(layer.self_attn, proj_name, None)
+            if proj_module is not None:
+                key = f"{layer_idx}.{proj_name}"
+                cap = _InputCapture()
+                cap.register(proj_module)
+                captures[key] = cap
+
+    logger.info(f"Registered {len(captures)} input captures across {num_layers} layers")
+
+    # Left-pad so last token is always at index -1
+    tokenizer.padding_side = "left"
 
     with torch.no_grad():
         for i in tqdm(range(0, len(prompts), batch_size), desc="Collecting activations"):
-            batch_prompts = prompts[i: i + batch_size]
+            batch_prompts = prompts[i:i + batch_size]
 
             formatted = []
             for p in batch_prompts:
@@ -102,28 +137,22 @@ def collect_hidden_states(
                     tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
                 )
 
-            # Left-padding: last real token is always at position index -1
-            tokenizer.padding_side = "left"
             inputs = tokenizer(formatted, return_tensors="pt", padding=True).to(device)
+            model(**inputs, output_hidden_states=False, return_dict=True)
 
-            outputs = model(
-                **inputs,
-                output_hidden_states=True,
-                return_dict=True,
-            )
+    # Collect results and remove hooks
+    result = {}
+    for key, cap in captures.items():
+        stacked = cap.get_stacked()
+        if stacked is not None:
+            result[key] = stacked
+        cap.remove()
 
-            # outputs.hidden_states: tuple of (num_layers + 1) tensors
-            # Index 0 = embedding layer; indices 1..num_layers = transformer layers
-            hidden_states = outputs.hidden_states
+    logger.info(f"Collected activations for {len(prompts)} prompts across {len(result)} projection points.")
+    if result:
+        sample_key = next(iter(result))
+        logger.info(f"Shape per projection: {result[sample_key].shape}")
 
-            for layer_idx in range(num_layers):
-                layer_out = hidden_states[layer_idx + 1]  # [batch, seq_len, d_model]
-                last_token = layer_out[:, -1, :].cpu()    # [batch, d_model]
-                layer_states[layer_idx].append(last_token)
-
-    result = {l: torch.cat(tensors, dim=0) for l, tensors in layer_states.items()}
-    logger.info(f"Collected hidden states for {len(prompts)} prompts across {num_layers} layers.")
-    logger.info(f"Shape per layer: {result[0].shape}")
     return result
 
 
@@ -132,120 +161,123 @@ def collect_hidden_states(
 # ===========================================================================
 
 def extract_safety_directions(
-    harmful_states: dict[int, torch.Tensor],
-    safe_states: dict[int, torch.Tensor],
+    harmful_states: dict[str, torch.Tensor],
+    safe_states: dict[str, torch.Tensor],
     k: int = 5,
-) -> dict[int, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """
-    For each transformer layer, computes the top-k safety directions using SVD
-    on the contrastive difference matrix.
+    For each projection point, computes the top-k safety directions using SVD
+    on the mean-centered contrastive difference matrix.
 
-    Math (UNCHANGED):
-        D_l = harmful_states_l - safe_states_l   shape: [N, d_model]
-        D_l = U @ S @ Vh                          SVD decomposition
-        safety_directions_l = Vh[:k].T            shape: [d_model, k]
-
-    The ROWS of Vh are the right singular vectors in R^d_model.
-    We take the top-k rows of Vh (first k rows), then transpose to get [d_model, k].
-    These k columns are the "safety directions" at layer l.
+    Math (v2 — mean-centered, L2-normalized):
+        D = harmful_states - safe_states           shape: [N, d_in]
+        D = D - D.mean(dim=0, keepdim=True)        mean-center
+        D = U @ S @ Vh                             SVD
+        directions = Vh[:k].T                      shape: [d_in, k]
+        directions = directions / ||directions||   L2-normalize each column
 
     Args:
-        harmful_states : Layer -> [N, d_model] hidden states for harmful prompts.
-        safe_states    : Layer -> [N, d_model] hidden states for safe prompts.
-        k              : Number of top directions to keep (committed to 5).
+        harmful_states : "{layer}.{proj}" -> [N, d_in] hidden states for harmful prompts.
+        safe_states    : "{layer}.{proj}" -> [N, d_in] hidden states for safe prompts.
+        k              : Number of top directions to keep.
 
     Returns:
-        dict mapping layer_idx -> tensor of shape [d_model, k].
+        dict mapping "{layer}.{proj}" -> tensor of shape [d_in, k], L2-normalized.
     """
-    assert harmful_states.keys() == safe_states.keys(), "Layer mismatch between prompt sets"
+    assert harmful_states.keys() == safe_states.keys(), (
+        f"Key mismatch: {set(harmful_states.keys()) - set(safe_states.keys())}"
+    )
+
     safety_directions = {}
 
-    for layer_idx in tqdm(harmful_states.keys(), desc="Computing SVD per layer"):
-        H = harmful_states[layer_idx].to(torch.float32)  # [N, d_model]
-        S = safe_states[layer_idx].to(torch.float32)     # [N, d_model]
+    for key in tqdm(sorted(harmful_states.keys()), desc="Computing SVD per projection"):
+        H = harmful_states[key].to(torch.float32)  # [N, d_in]
+        S = safe_states[key].to(torch.float32)      # [N, d_in]
 
-        # Difference matrix: D_l = H - S,  shape [N, d_model]
-        D = H - S
+        # Difference matrix
+        D = H - S  # [N, d_in]
 
-        # Economy SVD: Vh shape [min(N, d_model), d_model]
+        # Mean-center (v2 improvement)
+        D = D - D.mean(dim=0, keepdim=True)
+
+        # Economy SVD
         _, singular_values, Vh = torch.linalg.svd(D, full_matrices=False)
 
-        # Top-k right singular vectors: rows of Vh, transposed → [d_model, k]
-        top_k_directions = Vh[:k].T  # shape: [d_model, k]
-        safety_directions[layer_idx] = top_k_directions
+        # Top-k right singular vectors, transposed -> [d_in, k]
+        top_k_directions = Vh[:k].T
 
-        # AUDIT FIX: changed logger.debug → logger.info so variance info is visible
-        # by default (was silently suppressed at DEBUG level in the original code).
+        # L2-normalize each direction column (v2 improvement)
+        norms = top_k_directions.norm(dim=0, keepdim=True).clamp(min=1e-8)
+        top_k_directions = top_k_directions / norms
+
+        safety_directions[key] = top_k_directions
+
+        # Log variance explained
         total_var = (singular_values ** 2).sum().item()
         top_k_var = (singular_values[:k] ** 2).sum().item()
         explained = top_k_var / total_var * 100 if total_var > 0 else 0.0
         logger.info(
-            f"Layer {layer_idx:2d} | top-{k} singular values explain {explained:.1f}% of variance "
-            f"| top singular value: {singular_values[0].item():.4f}"
+            f"{key:15s} | top-{k} explain {explained:.1f}% variance "
+            f"| σ₁={singular_values[0].item():.4f}"
         )
 
     return safety_directions
 
 
 # ===========================================================================
-# Step 3: Verify directions — FULL VERSION (all layers, all k directions)
+# Step 3: Verify directions — full version
 # ===========================================================================
 
 def verify_directions_full(
-    safety_directions: dict[int, torch.Tensor],
-    harmful_states: dict[int, torch.Tensor],
-    safe_states: dict[int, torch.Tensor],
+    safety_directions: dict[str, torch.Tensor],
+    harmful_states: dict[str, torch.Tensor],
+    safe_states: dict[str, torch.Tensor],
     output_csv_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """
-    Full verification across ALL layers and ALL k directions.
+    Full verification across ALL projection points and ALL k directions.
 
-    For each layer l and each safety direction j:
+    For each key and each safety direction j:
         - Computes mean |projection| of harmful activations onto direction j.
         - Computes mean |projection| of safe activations onto direction j.
         - Reports separation = harmful_proj - safe_proj.
 
-    A positive separation for direction 1 (the top singular vector) confirms
-    the directions meaningfully separate harmful from safe content.
-
     Args:
-        safety_directions : Layer -> [d_model, k] extracted directions.
-        harmful_states    : Layer -> [N, d_model] harmful activations.
-        safe_states       : Layer -> [N, d_model] safe activations.
+        safety_directions : "{layer}.{proj}" -> [d_in, k] extracted directions.
+        harmful_states    : "{layer}.{proj}" -> [N, d_in] harmful activations.
+        safe_states       : "{layer}.{proj}" -> [N, d_in] safe activations.
         output_csv_path   : If provided, exports full statistics to this CSV path.
 
     Returns:
         pd.DataFrame with columns:
-            layer, dir_idx, harm_proj_mean, safe_proj_mean, separation,
-            harm_proj_std, safe_proj_std
+            key, dir_idx, harm_proj_mean, safe_proj_mean, separation, etc.
     """
-    logger.info("--- Full verification of safety directions (all layers, all k directions) ---")
+    logger.info("--- Full verification of safety directions (all projections, all k directions) ---")
 
     records = []
 
-    for l in sorted(harmful_states.keys()):
-        directions = safety_directions[l]      # [d_model, k]
+    for key in sorted(safety_directions.keys()):
+        directions = safety_directions[key]  # [d_in, k]
         k = directions.shape[1]
 
-        H = harmful_states[l].to(torch.float32)  # [N, d_model]
-        S = safe_states[l].to(torch.float32)     # [N, d_model]
+        H = harmful_states[key].to(torch.float32)
+        S = safe_states[key].to(torch.float32)
 
         for j in range(k):
-            direction = directions[:, j]  # [d_model]
+            direction = directions[:, j]  # [d_in]
 
-            # Project each example onto this direction
-            proj_harm = H @ direction   # [N]  (signed projections)
-            proj_safe = S @ direction   # [N]
+            proj_harm = H @ direction  # [N]
+            proj_safe = S @ direction  # [N]
 
-            harm_mean  = proj_harm.abs().mean().item()
-            harm_std   = proj_harm.abs().std().item()
-            safe_mean  = proj_safe.abs().mean().item()
-            safe_std   = proj_safe.abs().std().item()
+            harm_mean = proj_harm.abs().mean().item()
+            harm_std = proj_harm.abs().std().item()
+            safe_mean = proj_safe.abs().mean().item()
+            safe_std = proj_safe.abs().std().item()
             separation = harm_mean - safe_mean
 
             records.append({
-                "layer": l,
-                "dir_idx": j + 1,   # 1-indexed for readability
+                "key": key,
+                "dir_idx": j + 1,
                 "harm_proj_mean": harm_mean,
                 "harm_proj_std": harm_std,
                 "safe_proj_mean": safe_mean,
@@ -260,50 +292,50 @@ def verify_directions_full(
         df.to_csv(output_csv_path, index=False)
         logger.info(f"Separation statistics saved to: {output_csv_path}")
 
-    # Print a summary for direction 1 (the top safety direction — used in the paper metric)
+    # Summary for direction 1
     dir1 = df[df["dir_idx"] == 1].copy()
     n_positive = dir1["separation_positive"].sum()
     logger.info(
-        f"\nDirection 1 (paper metric) summary across {len(dir1)} layers:\n"
-        f"  Positive separation (harm > safe): {n_positive}/{len(dir1)} layers\n"
+        f"\nDirection 1 (paper metric) summary across {len(dir1)} projection points:\n"
+        f"  Positive separation (harm > safe): {n_positive}/{len(dir1)}\n"
         f"  Mean separation: {dir1['separation'].mean():.4f}\n"
-        f"  Max  separation: {dir1['separation'].max():.4f}  (layer {dir1.loc[dir1['separation'].idxmax(), 'layer']})\n"
-        f"  Min  separation: {dir1['separation'].min():.4f}  (layer {dir1.loc[dir1['separation'].idxmin(), 'layer']})"
+        f"  Max  separation: {dir1['separation'].max():.4f}  ({dir1.loc[dir1['separation'].idxmax(), 'key']})\n"
+        f"  Min  separation: {dir1['separation'].min():.4f}  ({dir1.loc[dir1['separation'].idxmin(), 'key']})"
     )
 
     return df
 
 
+# ===========================================================================
+# Step 4: Backward-compatible verification wrapper
+# ===========================================================================
+
 def verify_directions(
-    safety_directions: dict[int, torch.Tensor],
-    harmful_states: dict[int, torch.Tensor],
-    safe_states: dict[int, torch.Tensor],
+    safety_directions: dict[str, torch.Tensor],
+    harmful_states: dict[str, torch.Tensor],
+    safe_states: dict[str, torch.Tensor],
     num_layers_to_check: int = 5,
 ) -> None:
     """
-    Original verify_directions — kept for backward compatibility.
-    Now delegates to verify_directions_full and prints a subset of layers.
-
-    AUDIT NOTE: The original implementation only checked num_layers_to_check
-    (default 5) sampled layers, hiding failures in unchecked layers. This
-    wrapper still accepts the same signature but internally runs the full check.
+    Backward-compatible wrapper — delegates to verify_directions_full
+    and prints a subset of projection points.
     """
     df = verify_directions_full(safety_directions, harmful_states, safe_states)
 
-    logger.info("--- Sampled layer verification (Direction 1 only) ---")
+    logger.info("--- Sampled projection verification (Direction 1 only) ---")
 
-    total_layers = len(safety_directions)
-    step = max(1, total_layers // num_layers_to_check)
-    check_layers = sorted(safety_directions.keys())[::step][:num_layers_to_check]
+    all_keys = sorted(safety_directions.keys())
+    step = max(1, len(all_keys) // (num_layers_to_check * 2))
+    check_keys = all_keys[::step][:num_layers_to_check * 2]
 
-    for l in check_layers:
-        row = df[(df["layer"] == l) & (df["dir_idx"] == 1)]
+    for key in check_keys:
+        row = df[(df["key"] == key) & (df["dir_idx"] == 1)]
         if row.empty:
             continue
         harm = row["harm_proj_mean"].iloc[0]
         safe = row["safe_proj_mean"].iloc[0]
         logger.info(
-            f"Layer {l:2d} | mean |projection| — harmful: {harm:.4f}, safe: {safe:.4f}, "
+            f"{key:15s} | mean |projection| — harmful: {harm:.4f}, safe: {safe:.4f}, "
             f"separation: {harm - safe:+.4f}"
         )
 
@@ -314,18 +346,28 @@ def verify_directions(
 
 
 # ===========================================================================
+# Utility: parse key format
+# ===========================================================================
+
+def parse_direction_key(key: str) -> tuple[int, str]:
+    """Parse '{layer_idx}.{proj_name}' -> (layer_idx, proj_name)."""
+    parts = key.split(".")
+    return int(parts[0]), parts[1]
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 3: Safety Subspace Extraction")
-    parser.add_argument("--k", type=int, default=5, help="Number of top safety directions to keep per layer")
+    parser = argparse.ArgumentParser(description="Phase 3: Safety Subspace Extraction (v2, per-projection)")
+    parser.add_argument("--k", type=int, default=5, help="Number of top safety directions to keep per projection")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for activation collection")
     parser.add_argument("--device", type=str, default="cpu", help="Device: 'cpu' or 'cuda'")
     parser.add_argument("--num_prompts", type=int, default=520,
                         help="Number of harmful/safe pairs to use (max 520)")
     parser.add_argument("--export_separation_csv", action="store_true",
-                        help="Export full per-layer/per-direction separation stats to CSV")
+                        help="Export full per-projection/per-direction separation stats to CSV")
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -336,23 +378,18 @@ def main():
     output_path = models_dir / "safety_directions.pt"
 
     logger.info("=" * 60)
-    logger.info("Phase 3: Safety Subspace Extraction")
+    logger.info("Phase 3: Safety Subspace Extraction (v2, per-projection)")
     logger.info("=" * 60)
-    logger.info(f"  k (directions per layer) : {args.k}")
-    logger.info(f"  batch_size               : {args.batch_size}")
-    logger.info(f"  device                   : {args.device}")
-    logger.info(f"  num_prompts              : {args.num_prompts}")
-
-    # -----------------------------------------------------------------------
-    # COMPLIANCE WARNING: safe prompts are not semantic paraphrases
-    # -----------------------------------------------------------------------
-    
+    logger.info(f"  k (directions per projection) : {args.k}")
+    logger.info(f"  batch_size                    : {args.batch_size}")
+    logger.info(f"  device                        : {args.device}")
+    logger.info(f"  num_prompts                   : {args.num_prompts}")
 
     # -----------------------------------------------------------------------
     # 1. Load datasets
     # -----------------------------------------------------------------------
     logger.info("\nLoading datasets...")
-    harmful_prompts = load_advbench()[: args.num_prompts]
+    harmful_prompts = load_advbench()[:args.num_prompts]
     safe_prompts = load_safe_prompts(num_examples=args.num_prompts)
 
     assert len(harmful_prompts) == len(safe_prompts), (
@@ -381,28 +418,28 @@ def main():
     logger.info(f"Model loaded. Layers: {model.config.num_hidden_layers}, d_model: {model.config.hidden_size}")
 
     # -----------------------------------------------------------------------
-    # 3. Collect hidden states
+    # 3. Collect per-projection input activations
     # -----------------------------------------------------------------------
-    logger.info("\nCollecting hidden states for HARMFUL prompts...")
-    harmful_states = collect_hidden_states(
+    logger.info("\nCollecting per-projection inputs for HARMFUL prompts...")
+    harmful_states = collect_projection_inputs(
         model, tokenizer, harmful_prompts,
         batch_size=args.batch_size, device=args.device
     )
 
-    logger.info("\nCollecting hidden states for SAFE prompts...")
-    safe_states = collect_hidden_states(
+    logger.info("\nCollecting per-projection inputs for SAFE prompts...")
+    safe_states = collect_projection_inputs(
         model, tokenizer, safe_prompts,
         batch_size=args.batch_size, device=args.device
     )
 
     # -----------------------------------------------------------------------
-    # 4. Extract safety directions via SVD
+    # 4. Extract safety directions via SVD (mean-centered, L2-normalized)
     # -----------------------------------------------------------------------
-    logger.info(f"\nComputing top-{args.k} safety directions per layer via SVD...")
+    logger.info(f"\nComputing top-{args.k} safety directions per projection via SVD...")
     safety_directions = extract_safety_directions(harmful_states, safe_states, k=args.k)
 
     # -----------------------------------------------------------------------
-    # 5. Full verification of all layers and all k directions
+    # 5. Full verification
     # -----------------------------------------------------------------------
     sep_csv_path = results_dir / "separation_statistics.csv" if args.export_separation_csv else None
     verify_directions_full(safety_directions, harmful_states, safe_states, output_csv_path=sep_csv_path)
@@ -418,22 +455,28 @@ def main():
             "num_prompts": len(harmful_prompts),
             "num_layers": model.config.num_hidden_layers,
             "d_model": model.config.hidden_size,
-            "safe_prompt_type": "advbench_safe",# flagged: not true paraphrases
+            "safe_prompt_type": "advbench_safe",  # flagged: not true paraphrases
+            "key_format": "per_projection",       # v2 marker
+            "target_projections": list(TARGET_PROJECTIONS),
+            "mean_centered": True,
+            "l2_normalized": True,
         }
     }
     torch.save(save_payload, output_path)
     logger.info(f"\nSaved safety directions to: {output_path}")
 
     # Shape assertion
-    for l, directions in safety_directions.items():
+    for key, directions in safety_directions.items():
         assert directions.shape == (model.config.hidden_size, args.k), (
-            f"Layer {l}: expected shape ({model.config.hidden_size}, {args.k}), got {directions.shape}"
+            f"{key}: expected shape ({model.config.hidden_size}, {args.k}), got {directions.shape}"
         )
-    logger.info(f"Shape check passed: all layers have directions of shape [{model.config.hidden_size}, {args.k}]")
+    logger.info(f"Shape check passed: all {len(safety_directions)} projections have directions "
+                f"of shape [{model.config.hidden_size}, {args.k}]")
+    logger.info(f"Key format: {list(safety_directions.keys())[:4]}...")
 
     logger.info("\n" + "=" * 60)
-    logger.info("Phase 3 complete.")
-    logger.info("Next: run Phase 3 Step 3.2 — python src/verify_safety_directions.py")
+    logger.info("Phase 3 complete (v2, per-projection).")
+    logger.info("Next: run Phase 4 baselines with the new directions.")
     logger.info("=" * 60)
 
 

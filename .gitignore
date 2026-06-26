@@ -5,3 +5,4 @@ scratch.py
 models/safety_directions.pt
 env
 .env    
+*.ipynb

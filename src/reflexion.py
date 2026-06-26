@@ -200,13 +200,21 @@ class ReflexionMemory:
 
         lines = []
         for r in recent:
-            # Summarise the top-3 highest-lambda layers set in this decision
-            top_lambdas = sorted(
-                r["lambda_decisions"].items(),
-                key=lambda x: float(x[1]),
-                reverse=True,
-            )[:3]
-            lambda_str = ", ".join(f"λ_{l}={float(v):.2f}" for l, v in top_lambdas)
+            # Aggregate per-projection lambdas to per-layer for compact display
+            layer_avg = {}
+            for k, v in r["lambda_decisions"].items():
+                # Handle both string keys ("24.q_proj") and int keys (24)
+                key_str = str(k)
+                if "." in key_str:
+                    layer_idx = key_str.split(".")[0]
+                else:
+                    layer_idx = key_str
+                if layer_idx not in layer_avg:
+                    layer_avg[layer_idx] = []
+                layer_avg[layer_idx].append(float(v))
+            per_layer = {l: sum(vs)/len(vs) for l, vs in layer_avg.items()}
+            top_lambdas = sorted(per_layer.items(), key=lambda x: x[1], reverse=True)[:3]
+            lambda_str = ", ".join(f"λ_{l}={v:.2f}" for l, v in top_lambdas)
 
             lines.append(
                 f"  [Step {r['step']}] {lambda_str}\n"

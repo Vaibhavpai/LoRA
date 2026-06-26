@@ -1,7 +1,8 @@
 """
-run_baselines.py — Phase 4
-===========================
+run_baselines.py — Phase 4 (v2, per-projection)
+=================================================
 Runs SafeLoRA static baselines against the vanilla LoRA from Phase 2.
+Now uses per-projection string-keyed safety directions (56 keys).
 
   --variant a  : SafeLoRA Post-Hoc (B2A)
                  Loads the finished vanilla model → projects weights → evaluates.

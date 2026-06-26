@@ -1,13 +1,12 @@
 """
-run_agent.py — Phase 6
-========================
+run_agent.py — Phase 6 (v4.1, per-projection)
+================================================
 Runs Baseline 5: LoRA-SafeLoop Agentic Framework.
 Dynamically sets per-layer lambda constraints using a Groq LLM agent.
 
-v4 update: constraint is now a continuous auxiliary loss term added every
-training step (src/constraint_applier.py compute_penalty()), not a periodic
-SVD weight-projection. Lambda still only changes at eval checkpoints; the
-projection-every-100-steps + apply_projection() call has been removed.
+v4.1 update: per-projection string-keyed directions (56 keys).
+Agent still decides per-layer (28 decisions); constraint_applier expands
+to per-projection. CSV logs per-projection lambdas.
 
 Usage:
   export GROQ_API_KEY="your_api_key_here"
@@ -50,32 +49,40 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _extract_layer_ids(lambda_state: dict) -> list:
+    """Extract unique integer layer IDs from string-keyed lambda state."""
+    layer_ids = set()
+    for key in lambda_state.keys():
+        layer_idx = int(str(key).split(".")[0])
+        layer_ids.add(layer_idx)
+    return sorted(layer_ids)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Phase 6: LoRA-SafeLoop Agent (v4, continuous penalty)")
+    parser = argparse.ArgumentParser(description="Phase 6: LoRA-SafeLoop Agent (v4.1, per-projection)")
     parser.add_argument("--task",    type=str, required=True, choices=["gsm8k", "alpaca"])
     parser.add_argument("--seed",    type=int, default=42)
     parser.add_argument("--steps",   type=int, default=2000)
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--lr",      type=float, default=2e-4)
     parser.add_argument("--penalty_scale", type=float, default=0.01,
-                        help="Global scale on the safety penalty term added to the task loss every step.")
+                        help="Global scale on the safety penalty term.")
     parser.add_argument("--lambda_decay_rate", type=float, default=0.98,
-                        help="Per-checkpoint multiplicative decay applied to lambda before the agent observes state.")
+                        help="Per-checkpoint multiplicative decay for lambda.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint directory to resume from")
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
     logger.info("=" * 60)
-    logger.info(f"Phase 6 (v4, continuous penalty): Agentic Controller ({args.task}, seed={args.seed})")
+    logger.info(f"Phase 6 (v4.1, per-projection): Agentic Controller ({args.task}, seed={args.seed})")
     if args.resume_from_checkpoint:
         logger.info(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
     logger.info("=" * 60)
 
-    # Make sure API key is set
     groq_api_key = os.environ.get("GROQ_API_KEY")
     if not groq_api_key:
-        logger.warning("GROQ_API_KEY environment variable is not set. Agent calls will fail and fallback will be used.")
+        logger.warning("GROQ_API_KEY not set. Agent calls will fail and fallback will be used.")
 
     set_seed(args.seed)
 
@@ -91,7 +98,7 @@ def main():
     device   = "cuda" if torch.cuda.is_available() else "cpu"
     model_id = "Qwen/Qwen2.5-1.5B-Instruct"
 
-    # 1. Load safety directions
+    # 1. Load safety directions (v2: string-keyed, 56 keys)
     safety_directions, _ = load_safety_directions(models_dir)
 
     # 2. Load datasets
@@ -142,12 +149,14 @@ def main():
     # Initialize Reflexion memory
     reflexion_memory = ReflexionMemory(reflexion_path)
 
-    # Agent's shared mutable lambda state — start UNCONSTRAINED (like vanilla)
-    # so the agent can selectively ADD constraint only where needed.
+    # Constraint applier (v4.1: per-projection, string-keyed)
     applier = ConstraintApplier(model, safety_directions, device, initial_lambda=0.0)
     lambda_state = applier.get_lambdas()
 
-    # Measure TRUE baseline refusal rate BEFORE any training (pre-fine-tuning)
+    # Extract unique layer IDs for the agent's valid_layer_ids
+    valid_layer_ids = _extract_layer_ids(lambda_state)
+
+    # Measure pre-training baseline refusal rate
     logger.info("Measuring pre-training baseline refusal rate...")
     baseline_refusal_rate = evaluate_safety(
         model, tokenizer, advbench_prompts, batch_size=4, device=device
@@ -167,18 +176,19 @@ def main():
                 if len(history) > 0:
                     start_step = history[-1]["step"]
 
-                    for l in lambda_state.keys():
-                        col_name = f"lambda_layer_{l}"
+                    # Restore lambda state from CSV columns
+                    for key in lambda_state.keys():
+                        col_name = f"lambda_{key}"
                         if col_name in history[-1]:
-                            lambda_state[l] = float(history[-1][col_name])
+                            lambda_state[key] = float(history[-1][col_name])
 
                     baseline_refusal_rate = history[0]["refusal_rate"]
                     prev_refusal_rate = history[-1]["refusal_rate"]
                     refusal_history = [h["refusal_rate"] for h in history]
 
-                    logger.info(f"Successfully restored state from CSV: step={start_step}")
+                    logger.info(f"Restored state from CSV: step={start_step}")
                 else:
-                    logger.warning("CSV file found but has no matching entries.")
+                    logger.warning("CSV found but has no matching entries.")
             except Exception as e:
                 logger.error(f"Failed to restore history from CSV: {e}")
 
@@ -232,7 +242,7 @@ def main():
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         task_loss = outputs.loss / grad_accumulation_steps
 
-        # --- v4: continuous safety penalty, added every step, not every 100 ---
+        # Continuous safety penalty
         penalty = applier.compute_penalty() / grad_accumulation_steps
         loss = task_loss + args.penalty_scale * penalty
         loss.backward()
@@ -254,7 +264,7 @@ def main():
 
             if current_step % args.eval_every == 0:
                 is_final_step = (current_step >= args.steps)
-                logger.info(f"--- Eval{' (FINAL — no agent call)' if is_final_step else ' + Agent Update'} at Step {current_step} ---")
+                logger.info(f"--- Eval{' (FINAL)' if is_final_step else ' + Agent Update'} at Step {current_step} ---")
 
                 # Evaluate
                 refusal_rate = evaluate_safety(
@@ -269,21 +279,21 @@ def main():
                         model, tokenizer, eval_data, batch_size=4, device=device
                     )
 
-                # Subspace alignment (diagnostic — what the agent sees, same metric as before)
+                # Per-projection subspace alignment
                 alignments = compute_subspace_alignment(model, safety_directions)
                 mean_align = sum(alignments.values()) / len(alignments)
 
                 refusal_history.append(refusal_rate)
                 smoothed_refusal = sum(refusal_history[-3:]) / len(refusal_history[-3:])
 
-                # Complete the pending reflexion record with the measured outcomes
+                # Complete pending reflexion record
                 reflexion_memory.complete_pending(refusal_rate, task_metric)
 
-                # Apply λ decay BEFORE creating observation (agent sees decayed values)
+                # Apply λ decay
                 applier.decay_lambdas(rate=args.lambda_decay_rate)
                 lambda_state = applier.get_lambdas()
 
-                # UPDATE AGENT
+                # Build observation
                 observation = format_observation(
                     step=current_step,
                     total_steps=args.steps,
@@ -300,15 +310,15 @@ def main():
                 )
 
                 if is_final_step:
-                    logger.info("Final step reached — skipping agent call (no more training).")
+                    logger.info("Final step — skipping agent call.")
                     parsed = {
                         "layer_constraints": dict(lambda_state),
-                        "rationale": "[FINAL] Training complete, no adjustment needed.",
+                        "rationale": "[FINAL] Training complete.",
                         "predicted_outcome": "Training complete.",
                         "fallback_used": True,
                     }
                 else:
-                    logger.info("Calling Agent with observation...")
+                    logger.info("Calling Agent...")
                     agent_response = None
                     if groq_api_key:
                         agent_response = call_groq_agent(observation, api_key=groq_api_key)
@@ -316,12 +326,12 @@ def main():
                     parsed = parse_agent_response(
                         agent_response,
                         current_lambda_state=lambda_state,
-                        valid_layer_ids=list(lambda_state.keys()),
+                        valid_layer_ids=valid_layer_ids,
                         failure_log_path=str(failures_log_path),
                         alignments=alignments,
                     )
 
-                # --- v4: just update lambdas, no apply_projection() / SVD anymore ---
+                # Update lambdas
                 applier.set_all_lambdas(parsed["layer_constraints"])
 
                 reflexion_memory.add_pending(
@@ -344,8 +354,9 @@ def main():
                     "mean_alignment": mean_align,
                 }
 
-                for l in lambda_state.keys():
-                    record[f"lambda_layer_{l}"] = lambda_state[l]
+                # Per-projection lambda columns
+                for key in sorted(lambda_state.keys()):
+                    record[f"lambda_{key}"] = lambda_state[key]
 
                 history.append(record)
 
@@ -359,7 +370,7 @@ def main():
 
             step += 1
 
-    # Cleanup and Save
+    # Save final adapter
     adapter_save_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(adapter_save_dir)
     logger.info(f"Phase 6 Training Complete. Results: {csv_path}")
